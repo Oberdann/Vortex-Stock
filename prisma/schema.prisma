@@ -18,5 +18,8 @@ model Stock {
 model InboxEvent {
   eventId     String   @id @db.Uuid
   eventType   String
+  aggregateId String?  @db.Uuid
   processedAt DateTime @default(now())
+
+  @@index([aggregateId, eventType])
 }

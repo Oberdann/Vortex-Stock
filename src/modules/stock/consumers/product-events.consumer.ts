@@ -6,6 +6,7 @@ import { PrismaService } from "src/database/prisma.service";
 import {
   MAX_PROCESSING_RETRIES,
   PRODUCT_CREATED_EVENT,
+  PRODUCT_DELETED_EVENT,
   RABBITMQ_EVENTS_EXCHANGE,
   RETRY_DELAY_MS,
   STOCK_PRODUCT_CREATED_DLQ,
@@ -13,11 +14,15 @@ import {
   STOCK_PRODUCT_CREATED_FAILED_ROUTE,
   STOCK_PRODUCT_CREATED_QUEUE,
   STOCK_PRODUCT_CREATED_RETRY_QUEUE,
+  STOCK_PRODUCT_DELETED_DLQ,
+  STOCK_PRODUCT_DELETED_FAILED_ROUTE,
+  STOCK_PRODUCT_DELETED_QUEUE,
+  STOCK_PRODUCT_DELETED_RETRY_QUEUE,
 } from "src/common/messaging/rabbitmq-topology";
 
-interface ProductCreatedEvent {
+interface ProductEvent {
   eventId: string;
-  eventType: typeof PRODUCT_CREATED_EVENT;
+  eventType: typeof PRODUCT_CREATED_EVENT | typeof PRODUCT_DELETED_EVENT;
   data: { productId: string };
 }
 
@@ -26,12 +31,12 @@ const UUID_PATTERN =
 const RECONNECT_DELAY_MS = 5000;
 
 @Injectable()
-export class ProductCreatedConsumerService
+export class ProductEventsConsumerService
   implements OnModuleInit, OnModuleDestroy
 {
   private connection?: amqp.ChannelModel;
   private channel?: ConfirmChannel;
-  private consumerTag?: string;
+  private consumerTags: string[] = [];
   private reconnectTimer?: NodeJS.Timeout;
   private shuttingDown = false;
 
@@ -48,8 +53,12 @@ export class ProductCreatedConsumerService
     this.shuttingDown = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
 
-    if (this.channel && this.consumerTag) {
-      await this.channel.cancel(this.consumerTag).catch(() => undefined);
+    if (this.channel) {
+      await Promise.all(
+        this.consumerTags.map((consumerTag) =>
+          this.channel?.cancel(consumerTag).catch(() => undefined),
+        ),
+      );
     }
 
     await this.connection?.close().catch(() => undefined);
@@ -78,25 +87,32 @@ export class ProductCreatedConsumerService
       await this.declareTopology(channel);
       await channel.prefetch(10);
 
-      const result = await channel.consume(
+      const createdConsumer = await channel.consume(
         STOCK_PRODUCT_CREATED_QUEUE,
         (message) => {
           if (message) void this.handleMessage(channel, message);
         },
         { noAck: false },
       );
+      this.consumerTags.push(createdConsumer.consumerTag);
 
-      this.consumerTag = result.consumerTag;
+      const deletedConsumer = await channel.consume(
+        STOCK_PRODUCT_DELETED_QUEUE,
+        (message) => {
+          if (message) void this.handleMessage(channel, message);
+        },
+        { noAck: false },
+      );
+      this.consumerTags.push(deletedConsumer.consumerTag);
 
       this.logger.info(
-        { queue: STOCK_PRODUCT_CREATED_QUEUE },
-        "Consumidor de product.created conectado.",
+        { queues: [STOCK_PRODUCT_CREATED_QUEUE, STOCK_PRODUCT_DELETED_QUEUE] },
+        "Consumidor de eventos de produto conectado.",
       );
-
     } catch (error) {
       this.logger.error(
         { errorType: error instanceof Error ? error.name : "UnknownError" },
-        "Falha ao conectar o consumidor de product.created.",
+        "Falha ao conectar o consumidor de eventos de produto.",
       );
 
       await this.closeConnection();
@@ -144,6 +160,37 @@ export class ProductCreatedConsumerService
       RABBITMQ_EVENTS_EXCHANGE,
       PRODUCT_CREATED_EVENT,
     );
+
+    await channel.assertQueue(STOCK_PRODUCT_DELETED_DLQ, { durable: true });
+
+    await channel.bindQueue(
+      STOCK_PRODUCT_DELETED_DLQ,
+      STOCK_PRODUCT_CREATED_DLX,
+      STOCK_PRODUCT_DELETED_FAILED_ROUTE,
+    );
+
+    await channel.assertQueue(STOCK_PRODUCT_DELETED_RETRY_QUEUE, {
+      durable: true,
+      arguments: {
+        "x-message-ttl": RETRY_DELAY_MS,
+        "x-dead-letter-exchange": RABBITMQ_EVENTS_EXCHANGE,
+        "x-dead-letter-routing-key": PRODUCT_DELETED_EVENT,
+      },
+    });
+
+    await channel.assertQueue(STOCK_PRODUCT_DELETED_QUEUE, {
+      durable: true,
+      arguments: {
+        "x-dead-letter-exchange": STOCK_PRODUCT_CREATED_DLX,
+        "x-dead-letter-routing-key": STOCK_PRODUCT_DELETED_FAILED_ROUTE,
+      },
+    });
+
+    await channel.bindQueue(
+      STOCK_PRODUCT_DELETED_QUEUE,
+      RABBITMQ_EVENTS_EXCHANGE,
+      PRODUCT_DELETED_EVENT,
+    );
   }
 
   private async handleMessage(
@@ -155,7 +202,7 @@ export class ProductCreatedConsumerService
     if (!event) {
       this.logger.warn(
         { messageId: message.properties.messageId },
-        "Evento product.created inválido enviado para a DLQ.",
+        "Evento de produto inválido enviado para a DLQ.",
       );
 
       channel.nack(message, false, false);
@@ -164,26 +211,47 @@ export class ProductCreatedConsumerService
     }
 
     try {
-      await this.prisma.$transaction(async (transaction) => {
-        const processed = await transaction.inboxEvent.findUnique({
-          where: { eventId: event.eventId },
-        });
+      await this.prisma.$transaction(
+        async (transaction) => {
+          const processed = await transaction.inboxEvent.findUnique({
+            where: { eventId: event.eventId },
+          });
 
-        if (processed) return;
+          if (processed) return;
 
-        await transaction.inboxEvent.create({
-          data: {
-            eventId: event.eventId,
-            eventType: event.eventType,
-          },
-        });
+          const productWasDeleted =
+            event.eventType === PRODUCT_CREATED_EVENT &&
+            (await transaction.inboxEvent.findFirst({
+              where: {
+                aggregateId: event.data.productId,
+                eventType: PRODUCT_DELETED_EVENT,
+              },
+            }));
 
-        await transaction.stock.upsert({
-          where: { productId: event.data.productId },
-          create: { productId: event.data.productId, available: 0 },
-          update: {},
-        });
-      });
+          await transaction.inboxEvent.create({
+            data: {
+              eventId: event.eventId,
+              eventType: event.eventType,
+              aggregateId: event.data.productId,
+            },
+          });
+
+          if (event.eventType === PRODUCT_CREATED_EVENT) {
+            if (!productWasDeleted) {
+              await transaction.stock.upsert({
+                where: { productId: event.data.productId },
+                create: { productId: event.data.productId, available: 0 },
+                update: {},
+              });
+            }
+          } else {
+            await transaction.stock.deleteMany({
+              where: { productId: event.data.productId },
+            });
+          }
+        },
+        { isolationLevel: "Serializable" },
+      );
 
       channel.ack(message);
     } catch (error) {
@@ -193,18 +261,19 @@ export class ProductCreatedConsumerService
         return;
       }
 
-      await this.retryOrDeadLetter(channel, message, error);
+      await this.retryOrDeadLetter(channel, message, event.eventType, error);
     }
   }
 
-  private parseEvent(message: ConsumeMessage): ProductCreatedEvent | undefined {
+  private parseEvent(message: ConsumeMessage): ProductEvent | undefined {
     try {
       const event = JSON.parse(
         message.content.toString(),
-      ) as Partial<ProductCreatedEvent>;
+      ) as Partial<ProductEvent>;
 
       if (
-        event.eventType !== PRODUCT_CREATED_EVENT ||
+        (event.eventType !== PRODUCT_CREATED_EVENT &&
+          event.eventType !== PRODUCT_DELETED_EVENT) ||
         !event.eventId ||
         !UUID_PATTERN.test(event.eventId) ||
         !event.data?.productId ||
@@ -213,7 +282,7 @@ export class ProductCreatedConsumerService
         return undefined;
       }
 
-      return event as ProductCreatedEvent;
+      return event as ProductEvent;
     } catch {
       return undefined;
     }
@@ -222,6 +291,7 @@ export class ProductCreatedConsumerService
   private async retryOrDeadLetter(
     channel: ConfirmChannel,
     message: ConsumeMessage,
+    eventType: ProductEvent["eventType"],
     error: unknown,
   ) {
     const retryHeader = message.properties.headers?.retryCount;
@@ -247,7 +317,12 @@ export class ProductCreatedConsumerService
     }
 
     try {
-      channel.sendToQueue(STOCK_PRODUCT_CREATED_RETRY_QUEUE, message.content, {
+      const retryQueue =
+        eventType === PRODUCT_CREATED_EVENT
+          ? STOCK_PRODUCT_CREATED_RETRY_QUEUE
+          : STOCK_PRODUCT_DELETED_RETRY_QUEUE;
+
+      channel.sendToQueue(retryQueue, message.content, {
         persistent: true,
         contentType: message.properties.contentType,
         messageId: message.properties.messageId,
@@ -282,7 +357,7 @@ export class ProductCreatedConsumerService
   private handleDisconnect() {
     this.connection = undefined;
     this.channel = undefined;
-    this.consumerTag = undefined;
+    this.consumerTags = [];
 
     if (!this.shuttingDown) {
       this.logger.warn("Conexão com RabbitMQ perdida; reconexão agendada.");
@@ -297,7 +372,7 @@ export class ProductCreatedConsumerService
       this.reconnectTimer = undefined;
       void this.connectAndConsume();
     }, RECONNECT_DELAY_MS);
-    
+
     this.reconnectTimer.unref();
   }
 
@@ -305,7 +380,7 @@ export class ProductCreatedConsumerService
     const connection = this.connection;
     this.connection = undefined;
     this.channel = undefined;
-    this.consumerTag = undefined;
+    this.consumerTags = [];
     await connection?.close().catch(() => undefined);
   }
 }

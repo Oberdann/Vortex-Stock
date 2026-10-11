@@ -2,7 +2,7 @@ import { Module } from "@nestjs/common";
 import { DatabaseModule } from "src/database/prisma.module";
 import { StockController } from "./stock.controller";
 import { StockService } from "./stock.service";
-import { ProductCreatedConsumerService } from "src/modules/stock/consumers/product-created.consumer";
+import { ProductEventsConsumerService } from "src/modules/stock/consumers/product-events.consumer";
 
 @Module({
   imports: [DatabaseModule],
@@ -12,7 +12,7 @@ import { ProductCreatedConsumerService } from "src/modules/stock/consumers/produ
       provide: "IStockService",
       useClass: StockService,
     },
-    ProductCreatedConsumerService,
+    ProductEventsConsumerService,
   ],
 })
 export class StockModule {}
