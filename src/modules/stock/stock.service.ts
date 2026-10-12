@@ -5,12 +5,14 @@ import { CreateStockDto } from "./dtos/create-stock.dto";
 import { StockResponseDto } from "./dtos/stock-response.dto";
 import { StockAlreadyExistsException } from "./exceptions/stock-already-exists.exception";
 import { StockNotFoundException } from "./exceptions/stock-not-found.exception";
+import { InsufficientStockQuantityException } from "./exceptions/insufficient-stock-quantity.exception";
 import { StockMapper } from "./mapper/stock.mapper";
 import { UpdateStockDto } from "./dtos/update-stock.dto";
+import { InvalidReservationQuantityException } from "./exceptions/invalid-reservation-quantity.exception";
 
 @Injectable()
 export class StockService implements IStockService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(private readonly prisma: PrismaService) { }
 
   async create(stock: CreateStockDto): Promise<StockResponseDto> {
     const existingStock = await this.prisma.stock.findUnique({
@@ -62,6 +64,28 @@ export class StockService implements IStockService {
     const response = StockMapper.toResponseDto(updatedStock);
 
     return response;
+  }
+
+  async reserveQuantity(productId: string, quantity: number): Promise<void> {
+    const stock = await this.findStockOrFail(productId);
+
+    const quantityNotIsNumberValid = !Number.isInteger(quantity) || quantity <= 0;
+
+    if (quantityNotIsNumberValid) {
+      throw new InvalidReservationQuantityException(quantity);
+    }
+
+    if (stock.available < quantity) {
+      throw new InsufficientStockQuantityException(productId, quantity, stock.available);
+    }
+
+    await this.prisma.stock.update({
+      where: { productId },
+      data: {
+        available: stock.available - quantity,
+        reserved: stock.reserved + quantity,
+      },
+    });
   }
 
   private async findStockOrFail(productId: string) {

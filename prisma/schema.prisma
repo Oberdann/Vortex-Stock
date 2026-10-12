@@ -23,3 +23,17 @@ model InboxEvent {
 
   @@index([aggregateId, eventType])
 }
+
+model OutboxEvent {
+  id            String    @id @default(uuid()) @db.Uuid
+  aggregateId   String    @db.Uuid
+  eventType     String
+  payload       Json
+  attempts      Int       @default(0)
+  nextAttemptAt DateTime  @default(now())
+  lastError     String?
+  createdAt     DateTime  @default(now())
+  publishedAt   DateTime?
+
+  @@index([publishedAt, nextAttemptAt, createdAt])
+}

@@ -7,4 +7,5 @@ export interface IStockService {
   getById(productId: string): Promise<StockResponseDto>;
   getByIds(productIds: string[]): Promise<StockResponseDto[]>;
   update(productId: string, stock: UpdateStockDto): Promise<StockResponseDto>;
+  reserveQuantity(productId: string, quantity: number): Promise<void>;
 }
